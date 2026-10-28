@@ -3,8 +3,8 @@ use std::{collections::HashMap, convert::Infallible, fmt::Write as _};
 use expect_test::Expect;
 use rg_def_map::{
     DefMap, DefMapBuilder, DefMapSource, GeneratedItemRef, GeneratedSourceId, ItemSource,
-    ItemSourceKind, LocalDefData, LocalDefKind, ModuleData, ModuleOrigin, ModuleScopeBuilder,
-    Namespace, NamespaceSet, ScopeBinding, ScopeBindingProvenance, Visibility,
+    ItemSourceKind, LocalDefData, LocalDefKind, ModuleBuilder, ModuleOrigin, NameBinding,
+    NameBindingProvenance, Namespace, NamespaceSet, Visibility,
 };
 use rg_ir_model::{
     AssocItemId, CrateRef, DefId, DefMapRef, FileId, FloatTy, FunctionId, FunctionRef,
@@ -697,25 +697,14 @@ impl<'a> TraitSelectionFixtureParser<'a> {
         type_aliases: Vec<TypeAliasData>,
         mut structs: Vec<StructData>,
     ) -> TraitSelectionFixture {
-        let mut def_map_builder = DefMapBuilder::new(target());
-        let root_module = def_map_builder.alloc_module(ModuleData {
-            name: None,
-            name_span: None,
-            docs: None,
-            user_facing_attrs: Default::default(),
-            visibility: Visibility::Public,
-            parent: None,
-            children: Vec::new(),
-            local_defs: Vec::new(),
-            impls: Vec::new(),
-            imports: Vec::new(),
-            unresolved_imports: Vec::new(),
-            scope: Default::default(),
-            origin: ModuleOrigin::Root { file_id: FileId(0) },
-        });
+        let mut def_map_builder = DefMapBuilder::new(origin());
+        let root_module = def_map_builder.alloc_module(ModuleBuilder::new(
+            ModuleOrigin::Root { file_id: FileId(0) },
+            Visibility::Public,
+            None,
+        ));
         debug_assert_eq!(root_module, module().module);
 
-        let mut scope = ModuleScopeBuilder::default();
         let mut local_defs = Vec::new();
 
         // The fixture language describes semantic items directly, but trait selection resolves names
@@ -741,13 +730,14 @@ impl<'a> TraitSelectionFixtureParser<'a> {
             };
             struct_data.local_def = local_def_ref;
             local_defs.push(local_def);
-            scope.insert_binding(
+            def_map_builder.insert_direct_binding(
+                root_module,
                 &struct_data.name,
                 Namespace::Types,
-                ScopeBinding::new(
+                NameBinding::new(
                     DefId::Local(local_def_ref),
                     Visibility::Public,
-                    ScopeBindingProvenance::Direct,
+                    NameBindingProvenance::Direct,
                 ),
             );
         }
@@ -771,13 +761,14 @@ impl<'a> TraitSelectionFixtureParser<'a> {
             };
             trait_data.local_def = local_def_ref;
             local_defs.push(local_def);
-            scope.insert_binding(
+            def_map_builder.insert_direct_binding(
+                root_module,
                 &trait_data.name,
                 Namespace::Types,
-                ScopeBinding::new(
+                NameBinding::new(
                     DefId::Local(local_def_ref),
                     Visibility::Public,
-                    ScopeBindingProvenance::Direct,
+                    NameBindingProvenance::Direct,
                 ),
             );
         }
@@ -787,7 +778,6 @@ impl<'a> TraitSelectionFixtureParser<'a> {
             .expect("fixture root module should exist");
         let local_def_count = local_defs.len();
         module_data.local_defs = local_defs;
-        module_data.scope = scope.freeze();
 
         let mut builder = ItemStoreBuilder::new(origin(), local_def_count);
         for struct_data in structs {

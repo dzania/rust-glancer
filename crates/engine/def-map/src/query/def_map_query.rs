@@ -13,13 +13,14 @@ use rg_text::Name;
 use rustc_hash::FxHashSet;
 
 use super::{
-    path_resolution::ScopeResolver,
-    resolution_env::{CrateResolutionEnv, MacroDefinitionEnv, ScopeResolutionEnv},
+    name_resolution::NameResolver,
+    resolution_env::{CrateResolutionEnv, MacroDefinitionEnv, NameResolutionEnv},
 };
 use crate::{
     DefMap, ImportData, LocalDefData, LocalDefKind, LocalEnumVariantData, LocalEnumVariantEntry,
-    LocalImplData, MacroDefinitionView, ModuleData, ModuleOrigin, ModuleScopeBuilder, Namespace,
-    ScopeEntryRef, VisibleScopeDef, VisibleScopeDefs, VisibleScopeOrigin,
+    LocalImplData, MacroDefinitionView, ModuleData, ModuleOrigin, ModuleResolutionView,
+    NameBinding, NameBindingsView, Namespace, NamespaceSet, VisibleScopeDef, VisibleScopeDefs,
+    VisibleScopeOrigin,
 };
 
 /// Routes DefMap-origin refs and crate-level facts to concrete storage.
@@ -195,9 +196,9 @@ where
         self.source.target_pointer_width(crate_ref)
     }
 
-    /// Construct a scope resolver over this routed DefMap source.
-    pub fn scope_resolver(&self) -> ScopeResolver<'_, Self> {
-        ScopeResolver::new(self)
+    /// Construct a name resolver over this routed DefMap source.
+    pub fn name_resolver(&self) -> NameResolver<'_, Self> {
+        NameResolver::new(self)
     }
 
     /// Returns crates whose ordinary semantic items can participate in lookup from `root`.
@@ -254,10 +255,22 @@ where
         importing_module: ModuleRef,
         source_module: ModuleRef,
     ) -> Result<VisibleScopeDefs, S::Error> {
-        let scope = self
-            .scope_resolver()
-            .visible_scope(importing_module, source_module)?;
-        let mut defs = VisibleScopeDefs::new(&scope, VisibleScopeOrigin::ModuleScope, false);
+        let mut defs = VisibleScopeDefs::empty();
+        self.name_resolver().visit_visible_bindings(
+            importing_module,
+            source_module,
+            NamespaceSet::ALL,
+            |name, namespace, binding| {
+                defs.push_binding(
+                    name,
+                    namespace,
+                    binding,
+                    VisibleScopeOrigin::ItemScope,
+                    false,
+                );
+                Ok(())
+            },
+        )?;
         defs.sort();
         Ok(defs)
     }
@@ -281,14 +294,16 @@ where
         &self,
         importing_module: ModuleRef,
     ) -> Result<UniqueVec<LocalDefRef>, S::Error> {
-        let resolver = self.scope_resolver();
+        let resolver = self.name_resolver();
         let mut traits = UniqueVec::new();
         let mut current = Some(importing_module);
-        let no_shadowed_names = FxHashSet::default();
-
         while let Some(module_ref) = current {
-            let scope = resolver.visible_scope(importing_module, module_ref)?;
-            self.push_named_traits(&mut traits, &scope, &no_shadowed_names)?;
+            resolver.visit_visible_bindings(
+                importing_module,
+                module_ref,
+                NamespaceSet::TYPES,
+                |_, _, binding| self.push_named_trait(&mut traits, binding),
+            )?;
 
             let Some(module) = self.source.module_data(module_ref)? else {
                 break;
@@ -317,51 +332,51 @@ where
         &self,
         importing_module: ModuleRef,
     ) -> Result<UniqueVec<LocalDefRef>, S::Error> {
-        let resolver = self.scope_resolver();
-        let current_scope = resolver.visible_scope(importing_module, importing_module)?;
-        let no_shadowed_names = FxHashSet::default();
-        let occupied_type_names = current_scope
-            .entries()
-            .filter(|(_, entry)| !entry.bindings(Namespace::Types).is_empty())
-            .map(|(name, _)| name.clone())
-            .collect::<FxHashSet<_>>();
-
+        let resolver = self.name_resolver();
+        let mut occupied_type_names = FxHashSet::default();
         let mut traits = UniqueVec::new();
-        self.push_named_traits(&mut traits, &current_scope, &no_shadowed_names)?;
+        resolver.visit_visible_bindings(
+            importing_module,
+            importing_module,
+            NamespaceSet::TYPES,
+            |name, _, binding| {
+                occupied_type_names.insert(name.clone());
+                self.push_named_trait(&mut traits, binding)
+            },
+        )?;
         if let Some(module) = self.source.module_data(importing_module)? {
             self.push_unnamed_traits(&mut traits, &resolver, importing_module, module)?;
         }
 
         let crate_ref = importing_module.origin.origin_crate();
         if let Some(prelude) = self.source.prelude_module(crate_ref)? {
-            let prelude_scope = resolver.visible_scope(importing_module, prelude)?;
-            self.push_named_traits(&mut traits, &prelude_scope, &occupied_type_names)?;
+            resolver.visit_visible_bindings(
+                importing_module,
+                prelude,
+                NamespaceSet::TYPES,
+                |name, _, binding| {
+                    if !occupied_type_names.contains(name) {
+                        self.push_named_trait(&mut traits, binding)?;
+                    }
+                    Ok(())
+                },
+            )?;
         }
 
         Ok(traits)
     }
 
-    /// Add selected type bindings that are traits and whose spelling is not shadowed.
-    fn push_named_traits(
+    /// Add a selected type binding when it denotes a trait.
+    fn push_named_trait(
         &self,
         traits: &mut UniqueVec<LocalDefRef>,
-        scope: &ModuleScopeBuilder,
-        shadowed_names: &FxHashSet<Name>,
+        binding: &NameBinding,
     ) -> Result<(), S::Error> {
-        for (name, entry) in scope.entries() {
-            if shadowed_names.contains(name) {
-                continue;
-            }
-            for binding in entry.bindings(Namespace::Types) {
-                let DefId::Local(local_def) = binding.def else {
-                    continue;
-                };
-                if self.source.local_def_data(local_def)?.map(|data| data.kind)
-                    == Some(LocalDefKind::Trait)
-                {
-                    traits.push(local_def);
-                }
-            }
+        if let DefId::Local(local_def) = binding.def
+            && self.source.local_def_data(local_def)?.map(|data| data.kind)
+                == Some(LocalDefKind::Trait)
+        {
+            traits.push(local_def);
         }
         Ok(())
     }
@@ -370,7 +385,7 @@ where
     fn push_unnamed_traits(
         &self,
         traits: &mut UniqueVec<LocalDefRef>,
-        resolver: &ScopeResolver<'_, Self>,
+        resolver: &NameResolver<'_, Self>,
         importing_module: ModuleRef,
         module: &ModuleData,
     ) -> Result<(), S::Error> {
@@ -389,13 +404,26 @@ where
         &self,
         importing_module: ModuleRef,
     ) -> Result<VisibleScopeDefs, S::Error> {
-        let resolver = self.scope_resolver();
+        let resolver = self.name_resolver();
 
         // First-segment resolution checks the current module scope before extern roots and the
         // standard prelude. Completion follows the same namespace-specific shadowing order.
-        let current_scope = resolver.visible_scope(importing_module, importing_module)?;
-        let mut defs =
-            VisibleScopeDefs::new(&current_scope, VisibleScopeOrigin::ModuleScope, false);
+        let mut defs = VisibleScopeDefs::empty();
+        resolver.visit_visible_bindings(
+            importing_module,
+            importing_module,
+            NamespaceSet::ALL,
+            |name, namespace, binding| {
+                defs.push_binding(
+                    name,
+                    namespace,
+                    binding,
+                    VisibleScopeOrigin::ItemScope,
+                    false,
+                );
+                Ok(())
+            },
+        )?;
 
         let crate_ref = importing_module.origin.origin_crate();
         for visible in self.visible_absolute_root_defs(importing_module)? {
@@ -403,8 +431,15 @@ where
         }
 
         if let Some(prelude) = self.source.prelude_module(crate_ref)? {
-            let prelude_scope = resolver.visible_scope(importing_module, prelude)?;
-            defs.extend(&prelude_scope, VisibleScopeOrigin::Prelude, true);
+            resolver.visit_visible_bindings(
+                importing_module,
+                prelude,
+                NamespaceSet::ALL,
+                |name, namespace, binding| {
+                    defs.push_binding(name, namespace, binding, VisibleScopeOrigin::Prelude, true);
+                    Ok(())
+                },
+            )?;
         }
 
         defs.sort();
@@ -432,7 +467,8 @@ where
                     namespace: Namespace::Types,
                     def: rg_ir_model::DefId::Module(module_ref),
                     origin: VisibleScopeOrigin::ExternRoot,
-                    attribute_imports: Vec::new(),
+                    attribute_import: None,
+                    has_reexport: false,
                 },
                 false,
             );
@@ -442,36 +478,46 @@ where
     }
 }
 
-impl<S> ScopeResolutionEnv for DefMapQuery<S>
+impl<S> NameResolutionEnv for DefMapQuery<S>
 where
     S: DefMapSource,
 {
     type Error = S::Error;
 
-    fn module_data(&self, module_ref: ModuleRef) -> Result<Option<&ModuleData>, Self::Error> {
-        self.source.module_data(module_ref)
+    fn module_metadata(
+        &self,
+        module_ref: ModuleRef,
+    ) -> Result<Option<ModuleResolutionView<'_>>, Self::Error> {
+        Ok(self
+            .source
+            .module_data(module_ref)?
+            .map(ModuleData::resolution_view))
     }
 
     fn module_scope_entry<'a>(
         &'a self,
         module_ref: ModuleRef,
         name: &str,
-    ) -> Result<Option<ScopeEntryRef<'a>>, Self::Error> {
-        Ok(<Self as ScopeResolutionEnv>::module_data(self, module_ref)?
+    ) -> Result<Option<NameBindingsView<'a>>, Self::Error> {
+        Ok(self
+            .source
+            .module_data(module_ref)?
             .and_then(|module| module.scope.entry(name))
-            .map(|entry| entry.as_ref()))
+            .map(|entry| entry.as_view()))
     }
 
     fn module_scope_entries<'a>(
         &'a self,
         module_ref: ModuleRef,
-    ) -> Result<Vec<(&'a Name, ScopeEntryRef<'a>)>, Self::Error> {
-        Ok(<Self as ScopeResolutionEnv>::module_data(self, module_ref)?
+    ) -> Result<Vec<(&'a Name, NameBindingsView<'a>)>, Self::Error> {
+        Ok(self
+            .source
+            .module_data(module_ref)?
             .map(|module| {
                 module
                     .scope
                     .entries()
-                    .map(|(name, entry)| (name, entry.as_ref()))
+                    .map(|(name, entry)| (name, entry.as_view()))
                     .collect()
             })
             .unwrap_or_default())

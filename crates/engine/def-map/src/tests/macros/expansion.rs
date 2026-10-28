@@ -153,6 +153,39 @@ import_thing!();
 }
 
 #[test]
+fn generated_declarations_replace_glob_bindings_through_reexports() {
+    utils::check_project_path_resolution(
+        r#"
+//- /src/lib.rs crate:generated_binding_refresh
+mod original {
+    pub struct Item;
+}
+
+mod bridge {
+    pub use crate::original::*;
+
+    macro_rules! declare_item {
+        () => { pub struct Item; };
+    }
+
+    declare_item!();
+}
+
+pub use bridge::Item;
+"#,
+        &[
+            utils::PathResolutionQuery::lib("generated_binding_refresh", "crate", "bridge::Item")
+                .types(),
+            utils::PathResolutionQuery::lib("generated_binding_refresh", "crate", "Item").types(),
+        ],
+        expect![[r#"
+            generated_binding_refresh [lib] crate resolves bridge::Item [types] -> struct generated_binding_refresh[lib]::crate::bridge::Item
+            generated_binding_refresh [lib] crate resolves Item [types] -> struct generated_binding_refresh[lib]::crate::bridge::Item
+        "#]],
+    );
+}
+
+#[test]
 fn resolves_dollar_crate_in_generated_imports_to_macro_definition_crate() {
     let project = utils::DefMapFixtureDb::build(
         r#"
@@ -272,7 +305,7 @@ make_user!();
 fn stops_recursive_generated_macro_expansion_at_pass_limit() {
     let run = rg_profile::test_support::ProfileTest::start(
         profile_descriptors(),
-        "def_map.finalization,def_map.macros",
+        "def_map.construction,def_map.macros",
     );
     let project = utils::DefMapFixtureDb::build(
         r#"
@@ -306,7 +339,7 @@ pub struct After;
 
     target
         .entry("After")
-        .assert_type_exists("macro expansion limit should not abort def-map finalization");
+        .assert_type_exists("macro expansion limit should not abort DefMap construction");
     target
         .entry("FiniteResult")
         .assert_type_exists("an independent finite chain should complete before the limit");
@@ -517,7 +550,7 @@ macro_rules! cfg_select {
 }
 
 #[test]
-fn ambiguous_standard_prelude_macro_blocks_macro_use_fallback() {
+fn conflicting_standard_prelude_macros_keep_the_first_before_macro_use_fallback() {
     let project = utils::DefMapFixtureDb::build_with_sysroot(
         r#"
 //- /crates/dep/src/lib.rs crate:dep root:crates/dep
@@ -568,11 +601,69 @@ pub struct TokenStream;
 
     target
         .entry("FromFirstPrelude")
-        .assert_missing("ambiguous prelude macros should not pick the first candidate");
+        .assert_type_exists("conflicting prelude macros should expand the first useful target");
     target
         .entry("FromSecondPrelude")
-        .assert_missing("ambiguous prelude macros should not pick the second candidate");
+        .assert_missing("the first prelude macro should win the conflict");
     target
         .entry("FromMacroUse")
-        .assert_missing("ambiguous prelude macros should block later fallback lookup");
+        .assert_missing("the selected prelude macro should take precedence over legacy fallback");
+}
+
+#[test]
+fn generated_extern_crate_preserves_aliases_and_macro_use() {
+    utils::check_project_path_resolution(
+        r#"
+//- /dep/src/lib.rs crate:dep root:dep
+pub struct Dependency;
+#[macro_export]
+macro_rules! declare { () => { pub struct Generated; }; }
+
+//- /app/src/lib.rs crate:app root:app deps:dep
+macro_rules! import_dep {
+    () => { #[macro_use] extern crate dep as api; };
+}
+import_dep!();
+
+mod child { pub use api::Dependency; }
+pub use child::Dependency;
+declare!();
+"#,
+        &[
+            utils::PathResolutionQuery::lib("app", "crate", "api::Dependency").types(),
+            utils::PathResolutionQuery::lib("app", "crate::child", "api::Dependency").types(),
+            utils::PathResolutionQuery::lib("app", "crate", "Dependency").types(),
+            utils::PathResolutionQuery::lib("app", "crate", "Generated").types(),
+        ],
+        expect![[r#"
+            app [lib] crate resolves api::Dependency [types] -> struct dep[lib]::crate::Dependency
+            app [lib] crate::child resolves api::Dependency [types] -> struct dep[lib]::crate::Dependency
+            app [lib] crate resolves Dependency [types] -> struct dep[lib]::crate::Dependency
+            app [lib] crate resolves Generated [types] -> struct app[lib]::crate::Generated
+        "#]],
+    );
+}
+
+#[test]
+fn glob_updates_follow_the_winning_route_independently_of_attributes() {
+    utils::check_project_path_resolution(
+        r#"
+//- /src/lib.rs crate:glob_route_refresh
+mod original { pub struct Item; }
+mod bridge {
+    pub use crate::original::*;
+    macro_rules! declare_item { () => { pub struct Item; }; }
+    declare_item!();
+}
+mod facade {
+    #[doc(hidden)]
+    pub use crate::bridge::*;
+    pub use crate::original::*;
+}
+"#,
+        &[utils::PathResolutionQuery::lib("glob_route_refresh", "crate", "facade::Item").types()],
+        expect![[r#"
+            glob_route_refresh [lib] crate resolves facade::Item [types] -> struct glob_route_refresh[lib]::crate::bridge::Item
+        "#]],
+    );
 }

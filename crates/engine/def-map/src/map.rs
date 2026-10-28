@@ -1,24 +1,23 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, convert::Infallible, mem};
 
 use rg_arena::Arena;
 use rg_ir_model::{
-    BodyRef, CrateRef, DefMapRef, FileId, ImportId, LocalDefId, LocalDefRef, LocalEnumVariantId,
-    LocalEnumVariantRef, LocalImplId, LocalImplRef, ModuleId, ModuleRef,
+    DefMapRef, FileId, ImportId, LocalDefId, LocalDefRef, LocalEnumVariantId, LocalEnumVariantRef,
+    LocalImplId, LocalImplRef, ModuleId, ModuleRef,
 };
 use rg_item_tree::{EnumItem, FieldList, ItemKind, VisibilityLevel};
-use rg_std::{MemorySize, Shrink};
-use rg_text::identifier_text;
+use rg_std::{MemoryRecorder, MemorySize, Shrink};
+use rg_text::{Name, identifier_text};
 use wincode::{SchemaRead, SchemaWrite};
 
 use crate::{
     ItemSource,
+    binding::{NameBinding, Namespace, NamespaceSet, PerNs, Visibility},
     import::ImportData,
-    local::{
-        LocalDefData, LocalEnumVariantData, LocalEnumVariantEntry, LocalImplData,
-        MacroDefinitionData,
-    },
-    module::ModuleData,
-    scope::{Namespace, NamespaceSet, PerNs, Visibility},
+    item_scope::ItemScopeBuilder,
+    local::{LocalDefData, LocalEnumVariantData, LocalEnumVariantEntry, LocalImplData},
+    macro_definition::MacroDefinitionData,
+    module::{ModuleBuilder, ModuleData},
     source::{GeneratedItemStore, GeneratedSourceData, GeneratedSourceId},
 };
 
@@ -34,54 +33,135 @@ struct DefMapData {
     imports: Arena<ImportId, ImportData>,
 }
 
+/// Collects declarations and import results before producing a frozen DefMap.
+///
+/// Collectors add modules, items, and direct bindings here. Import resolution retains those
+/// bindings and adds imported answers to the same scope.
+///
+/// Crate builds also retain generated syntax for Semantic IR. Freezing moves that syntax out
+/// separately, so the queryable DefMap does not keep the expansion arena alive.
 #[derive(Debug)]
 pub struct DefMapBuilder {
-    def_map: DefMap,
+    own_ref: DefMapRef,
+    modules: Arena<ModuleId, ModuleBuilder>,
+    local_defs: Arena<LocalDefId, LocalDefData>,
+    local_enum_variants: Arena<LocalEnumVariantId, LocalEnumVariantData>,
+    macro_definitions: HashMap<LocalDefId, MacroDefinitionData>,
+    foreign_blocks: HashMap<LocalDefId, ItemSource>,
+    local_impls: Arena<LocalImplId, LocalImplData>,
+    imports: Arena<ImportId, ImportData>,
     generated_items: GeneratedItemStore,
 }
 
 impl DefMapBuilder {
-    pub fn new(crate_ref: CrateRef) -> Self {
+    pub fn new(own_ref: DefMapRef) -> Self {
         Self {
-            def_map: DefMap::krate(crate_ref),
+            own_ref,
+            modules: Arena::new(),
+            local_defs: Arena::new(),
+            local_enum_variants: Arena::new(),
+            macro_definitions: HashMap::new(),
+            foreign_blocks: HashMap::new(),
+            local_impls: Arena::new(),
+            imports: Arena::new(),
             generated_items: GeneratedItemStore::default(),
         }
     }
 
-    pub fn new_body(body_ref: BodyRef) -> Self {
-        Self {
-            def_map: DefMap::body(body_ref),
-            generated_items: GeneratedItemStore::default(),
-        }
+    pub fn module(&self, module_id: ModuleId) -> Option<&ModuleBuilder> {
+        self.modules.get(module_id)
     }
 
-    pub fn partial(&self) -> PartialDefMap<'_> {
-        PartialDefMap {
-            def_map: &self.def_map,
-            generated_items: &self.generated_items,
-        }
+    pub fn module_mut(&mut self, module_id: ModuleId) -> Option<&mut ModuleBuilder> {
+        self.modules.get_mut(module_id)
     }
 
-    pub fn module_mut(&mut self, module_id: ModuleId) -> Option<&mut ModuleData> {
-        self.def_map.data.modules.get_mut(module_id)
+    pub fn module_count(&self) -> usize {
+        self.modules.len()
     }
 
-    pub fn alloc_module(&mut self, module: ModuleData) -> ModuleId {
-        self.def_map.data.modules.alloc(module)
+    /// Allocate all construction state for one module under a stable module id.
+    pub fn alloc_module(&mut self, module: ModuleBuilder) -> ModuleId {
+        self.modules.alloc(module)
+    }
+
+    /// Collect a declaration into the scope used by both import and macro lookup.
+    ///
+    /// Expansion can add a declaration after imports have already populated the scope. Select it
+    /// against the existing answer too: a declaration shadows a glob, while equal-priority
+    /// conflicts keep the earlier answer.
+    pub fn insert_direct_binding(
+        &mut self,
+        module: ModuleId,
+        name: &Name,
+        namespace: Namespace,
+        binding: NameBinding,
+    ) {
+        let binding = self
+            .module_scope(module)
+            .and_then(|scope| scope.binding(name, namespace))
+            .map_or(binding, |existing| {
+                existing
+                    .select(binding, |left, right| {
+                        Ok::<_, Infallible>(self.broadest_visibility(left, right))
+                    })
+                    .expect("local visibility comparison is infallible")
+            });
+        self.modules
+            .get_mut(module)
+            .expect("binding module should exist")
+            .scope
+            .set_binding(name, namespace, binding);
+    }
+
+    /// Lend the scope buffer to import resolution; return it before macro lookup or freezing.
+    ///
+    /// The module keeps its metadata and an empty scope placeholder. Import lookup must use the
+    /// collector's overlay until `apply_module_imports` puts the updated buffer back.
+    pub fn take_module_scope(&mut self, module: ModuleId) -> ItemScopeBuilder {
+        mem::take(
+            &mut self
+                .modules
+                .get_mut(module)
+                .expect("import module exists")
+                .scope,
+        )
+    }
+
+    /// Read declarations and retained import answers.
+    pub fn module_scope(&self, module: ModuleId) -> Option<&ItemScopeBuilder> {
+        self.modules.get(module).map(|module| &module.scope)
+    }
+
+    pub(crate) fn module_scope_mut(&mut self, module: ModuleId) -> Option<&mut ItemScopeBuilder> {
+        self.modules.get_mut(module).map(|module| &mut module.scope)
+    }
+
+    /// Return the scope buffer and its unresolved-import report after import collection.
+    /// A glob can resolve to an empty module, so the report can change even without new bindings.
+    pub fn apply_module_imports(
+        &mut self,
+        module: ModuleId,
+        scope: ItemScopeBuilder,
+        unresolved_imports: Vec<ImportId>,
+    ) {
+        let module = self
+            .modules
+            .get_mut(module)
+            .expect("import module should exist");
+        module.scope = scope;
+        module.unresolved_imports = unresolved_imports;
     }
 
     pub fn alloc_local_def(&mut self, local_def: LocalDefData) -> LocalDefId {
-        self.def_map.data.local_defs.alloc(local_def)
+        self.local_defs.alloc(local_def)
     }
 
     pub fn alloc_local_enum_variant(
         &mut self,
         local_enum_variant: LocalEnumVariantData,
     ) -> LocalEnumVariantId {
-        self.def_map
-            .data
-            .local_enum_variants
-            .alloc(local_enum_variant)
+        self.local_enum_variants.alloc(local_enum_variant)
     }
 
     /// Retain the variants needed by qualified paths and imports before semantic item lowering.
@@ -114,21 +194,18 @@ impl DefMapBuilder {
         local_def: LocalDefId,
         macro_definition: MacroDefinitionData,
     ) {
-        self.def_map
-            .data
-            .macro_definitions
-            .insert(local_def, macro_definition);
+        self.macro_definitions.insert(local_def, macro_definition);
     }
 
     /// Records the extern block that owns one otherwise-ordinary local definition.
     ///
     /// This stays in a sparse map so normal Rust declarations do not pay a per-item memory cost.
     pub fn insert_foreign_block(&mut self, local_def: LocalDefId, block: ItemSource) {
-        self.def_map.data.foreign_blocks.insert(local_def, block);
+        self.foreign_blocks.insert(local_def, block);
     }
 
     pub fn alloc_local_impl(&mut self, local_impl: LocalImplData) -> LocalImplId {
-        self.def_map.data.local_impls.alloc(local_impl)
+        self.local_impls.alloc(local_impl)
     }
 
     /// Records the generated items that replace one trait/impl macro invocation.
@@ -142,7 +219,7 @@ impl DefMapBuilder {
     }
 
     pub fn alloc_import(&mut self, import: ImportData) -> ImportId {
-        self.def_map.data.imports.alloc(import)
+        self.imports.alloc(import)
     }
 
     pub(crate) fn alloc_generated_source(
@@ -180,7 +257,7 @@ impl DefMapBuilder {
         }
 
         Visibility::Module(ModuleRef {
-            origin: self.def_map.own_ref,
+            origin: self.own_ref,
             module: visible_from,
         })
     }
@@ -217,6 +294,25 @@ impl DefMapBuilder {
         visibilities
     }
 
+    /// Valid restrictions on one module's binding form an ancestor chain. Keep the first region
+    /// if incomplete syntax produced unrelated restrictions instead of widening it arbitrarily.
+    fn broadest_visibility(&self, left: Visibility, right: Visibility) -> Visibility {
+        match (left, right) {
+            (Visibility::Public, _) | (_, Visibility::Public) => Visibility::Public,
+            (Visibility::Invisible, visibility) | (visibility, Visibility::Invisible) => visibility,
+            (Visibility::Module(left), Visibility::Module(right)) => {
+                if left.origin == self.own_ref
+                    && right.origin == self.own_ref
+                    && self.module_is_descendant_of(left.module, right.module)
+                {
+                    Visibility::Module(right)
+                } else {
+                    Visibility::Module(left)
+                }
+            }
+        }
+    }
+
     fn intersect_visibility(&self, left: Visibility, right: Visibility) -> Visibility {
         match (left, right) {
             (Visibility::Invisible, _) | (_, Visibility::Invisible) => Visibility::Invisible,
@@ -237,7 +333,7 @@ impl DefMapBuilder {
     }
 
     fn parent_module(&self, module: ModuleId) -> Option<ModuleId> {
-        self.def_map.module(module)?.parent
+        self.module(module)?.parent
     }
 
     fn root_module(&self, module: ModuleId) -> Option<ModuleId> {
@@ -265,9 +361,13 @@ impl DefMapBuilder {
                 "self" => current,
                 "super" => self.parent_module(current)?,
                 "crate" | "" => return None,
-                name => self.def_map.module(current)?.children.iter().find_map(
-                    |(child_name, child)| (child_name == identifier_text(name)).then_some(*child),
-                )?,
+                name => self
+                    .module(current)?
+                    .children
+                    .iter()
+                    .find_map(|(child_name, child)| {
+                        (child_name == identifier_text(name)).then_some(*child)
+                    })?,
             };
         }
 
@@ -285,84 +385,88 @@ impl DefMapBuilder {
         false
     }
 
-    pub fn build(self) -> DefMap {
-        debug_assert!(
-            self.generated_items.is_empty(),
-            "generated crate declarations must be handed to Semantic IR",
-        );
-        self.def_map
+    pub(crate) fn local_defs(&self) -> &[LocalDefData] {
+        self.local_defs.as_slice()
     }
 
-    /// Separates frozen resolution data from the generated declarations consumed by Semantic IR.
-    pub(crate) fn into_parts(self) -> (DefMap, GeneratedItemStore) {
-        (self.def_map, self.generated_items)
-    }
-}
-
-/// Read-only view over a DefMap that is still being collected/finalized.
-///
-/// This facade is intentionally narrower than `DefMap`: it permits the build pipeline to inspect
-/// data allocated so far without making the object look like a frozen namespace map.
-#[derive(Debug, Clone, Copy)]
-pub struct PartialDefMap<'a> {
-    def_map: &'a DefMap,
-    generated_items: &'a GeneratedItemStore,
-}
-
-impl<'a> PartialDefMap<'a> {
-    pub(crate) fn local_defs(&self) -> &'a [LocalDefData] {
-        self.def_map.local_defs()
+    /// Returns local definition data allocated so far during construction.
+    pub fn local_def(&self, local_def: LocalDefId) -> Option<&LocalDefData> {
+        self.local_defs.get(local_def)
     }
 
-    /// Returns module data allocated so far during collection/finalization.
-    pub fn module(&self, module_id: ModuleId) -> Option<&'a ModuleData> {
-        self.def_map.module(module_id)
-    }
-
-    pub fn module_count(&self) -> usize {
-        self.def_map.module_count()
-    }
-
-    /// Returns local definition data allocated so far during collection/finalization.
-    pub fn local_def(&self, local_def: LocalDefId) -> Option<&'a LocalDefData> {
-        self.def_map.local_def(local_def)
-    }
-
-    /// Returns enum variant data allocated so far during collection/finalization.
+    /// Returns enum variant data allocated so far during construction.
     pub fn local_enum_variant(
         &self,
         local_enum_variant: LocalEnumVariantId,
-    ) -> Option<&'a LocalEnumVariantData> {
-        self.def_map.local_enum_variant(local_enum_variant)
+    ) -> Option<&LocalEnumVariantData> {
+        self.local_enum_variants.get(local_enum_variant)
     }
 
     pub fn local_enum_variant_entries_for_enum(
         &self,
         enum_def: LocalDefId,
-    ) -> impl Iterator<Item = LocalEnumVariantEntry<'a>> + 'a {
-        self.def_map.local_enum_variant_entries_for_enum(enum_def)
+    ) -> impl Iterator<Item = LocalEnumVariantEntry<'_>> {
+        self.local_enum_variants
+            .iter_with_ids()
+            .filter(move |(_, variant)| variant.enum_def == enum_def)
+            .map(move |(id, data)| LocalEnumVariantEntry::new(self.own_ref, id, data))
     }
 
-    /// Returns a declarative macro payload allocated so far during collection/finalization.
-    pub fn macro_definition(&self, local_def: LocalDefId) -> Option<&'a MacroDefinitionData> {
-        self.def_map.macro_definition(local_def)
+    /// Returns a declarative macro payload allocated so far during construction.
+    pub fn macro_definition(&self, local_def: LocalDefId) -> Option<&MacroDefinitionData> {
+        self.macro_definitions.get(&local_def)
     }
 
-    /// Returns imports allocated so far during collection/finalization.
-    pub fn imports(&self) -> &'a [ImportData] {
-        self.def_map.imports()
+    /// Returns imports allocated so far during construction.
+    pub fn imports(&self) -> &[ImportData] {
+        self.imports.as_slice()
     }
 
-    pub fn imports_with_ids(&self) -> impl Iterator<Item = (ImportId, &'a ImportData)> + 'a {
-        self.def_map.imports_with_ids()
+    pub fn imports_with_ids(&self) -> impl Iterator<Item = (ImportId, &ImportData)> {
+        self.imports.iter_with_ids()
     }
 
     /// Returns a generated source allocated so far during macro collection.
     pub(crate) fn generated_source(
         &self,
         generated_source: GeneratedSourceId,
-    ) -> Option<&'a GeneratedSourceData> {
+    ) -> Option<&GeneratedSourceData> {
         self.generated_items.source(generated_source)
+    }
+
+    pub fn build(self) -> DefMap {
+        let (def_map, generated_items) = self.into_parts();
+        debug_assert!(
+            generated_items.is_empty(),
+            "generated crate declarations must be handed to Semantic IR",
+        );
+        def_map
+    }
+
+    /// Freeze each module and move declaration arenas into the retained map.
+    /// Generated syntax leaves separately for Semantic IR lowering.
+    pub(crate) fn into_parts(self) -> (DefMap, GeneratedItemStore) {
+        // Keep allocation order: parent links, imports, and bindings already contain these ids.
+        let modules = Arena::from_vec(
+            self.modules
+                .into_vec()
+                .into_iter()
+                .map(ModuleBuilder::freeze)
+                .collect(),
+        );
+        let def_map = DefMap {
+            own_ref: self.own_ref,
+            data: DefMapData {
+                modules,
+                local_defs: self.local_defs,
+                local_enum_variants: self.local_enum_variants,
+                macro_definitions: self.macro_definitions,
+                foreign_blocks: self.foreign_blocks,
+                local_impls: self.local_impls,
+                imports: self.imports,
+            },
+        };
+        (def_map, self.generated_items)
     }
 }
 
@@ -382,20 +486,6 @@ pub struct DefMap {
 }
 
 impl DefMap {
-    fn krate(crate_ref: CrateRef) -> Self {
-        Self {
-            own_ref: DefMapRef::Crate(crate_ref),
-            data: DefMapData::default(),
-        }
-    }
-
-    fn body(body_ref: BodyRef) -> Self {
-        Self {
-            own_ref: DefMapRef::Body(body_ref),
-            data: DefMapData::default(),
-        }
-    }
-
     pub fn own_ref(&self) -> DefMapRef {
         self.own_ref
     }
@@ -516,7 +606,7 @@ impl DefMap {
 }
 
 impl MemorySize for DefMap {
-    fn record_memory_children(&self, recorder: &mut rg_std::MemoryRecorder) {
+    fn record_memory_children(&self, recorder: &mut MemoryRecorder) {
         recorder.scope("data", |recorder| {
             MemorySize::record_memory_children(&self.data, recorder);
         });

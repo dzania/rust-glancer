@@ -1,6 +1,7 @@
 use expect_test::expect;
 
 use super::utils;
+use crate::Namespace;
 
 #[test]
 fn explicit_bindings_shadow_globs_independent_of_import_order() {
@@ -149,7 +150,7 @@ pub enum Choice {
 }
 
 #[test]
-fn equal_priority_imports_record_ambiguity() {
+fn equal_priority_imports_keep_the_first_definition() {
     let project = utils::DefMapFixtureDb::build(
         r#"
 //- /src/lib.rs crate:ambiguous_import_fixture
@@ -170,14 +171,14 @@ pub struct Thing;
     project
         .lib("ambiguous_import_fixture")
         .entry("Thing")
-        .assert_type_ambiguous(
-            2,
-            "distinct named imports should remain an explicit ambiguity",
+        .assert_type_source_file(
+            "first.rs",
+            "conflicting imports should retain the first useful target",
         );
 }
 
 #[test]
-fn duplicate_glob_routes_to_one_definition_are_not_ambiguous() {
+fn duplicate_glob_imports_select_one_definition() {
     let project = utils::DefMapFixtureDb::build(
         r#"
 //- /src/lib.rs crate:duplicate_glob_route_fixture
@@ -201,10 +202,52 @@ use second::*;
     project
         .lib("duplicate_glob_route_fixture")
         .entry("Thing")
-        .assert_type_resolved_with_routes(
-            2,
-            "two glob routes to one definition should merge under one selected binding",
-        );
+        .assert_type_exists("two glob imports of one definition should keep one useful target");
+}
+
+#[test]
+fn repeated_globs_keep_the_broadest_visibility_in_either_order() {
+    for broad_first in [false, true] {
+        let imports = |visibility: &str| {
+            let private = "use crate::source::*;";
+            let broad = format!("{visibility} use crate::source::*;");
+            if broad_first {
+                format!("{broad}\n{private}")
+            } else {
+                format!("{private}\n{broad}")
+            }
+        };
+        let fixture = r#"
+//- /dep/src/lib.rs crate:dep root:dep
+mod source {
+    pub struct Shared {}
+}
+
+mod crate_facade {
+    $crate_imports
+}
+
+pub mod public_facade {
+    $public_imports
+}
+
+use crate_facade::Shared as CrateWide;
+
+//- /app/src/lib.rs crate:app root:app deps:dep
+use dep::public_facade::Shared as Public;
+"#
+        .replace("$crate_imports", &imports("pub(crate)"))
+        .replace("$public_imports", &imports("pub"));
+        let project = utils::DefMapFixtureDb::build(&fixture);
+        project
+            .lib("dep")
+            .entry("CrateWide")
+            .assert_type_exists("the broader module visibility should survive either glob order");
+        project
+            .lib("app")
+            .entry("Public")
+            .assert_type_exists("public visibility should survive either glob order across crates");
+    }
 }
 
 #[test]
@@ -320,4 +363,82 @@ use missing::Thing as _;
             - work : value [pub fn hidden_unresolved_import_fixture[lib]::crate::existing::work]
         "#]],
     );
+}
+
+#[test]
+fn cyclic_imports_keep_a_stable_declaration_backed_target() {
+    for (a_import, b_import, expected) in [
+        (
+            "pub use crate::b::*;",
+            "pub use crate::a::*;",
+            Some("DirectLeft"),
+        ),
+        ("pub use crate::b::Thing;", "pub use crate::a::*;", None),
+        ("pub use crate::b::Thing;", "pub use crate::a::Thing;", None),
+    ] {
+        let fixture = format!(
+            r#"
+//- /src/lib.rs crate:import_cycle
+mod a;
+mod b;
+mod left;
+mod right;
+pub use a::Thing as FromA;
+pub use b::Thing as FromB;
+pub use left::Thing as DirectLeft;
+pub use right::Thing as DirectRight;
+//- /src/a.rs
+{a_import}
+pub use crate::left::*;
+//- /src/b.rs
+{b_import}
+pub use crate::right::*;
+//- /src/left.rs
+pub struct Thing;
+//- /src/right.rs
+pub struct Thing;
+"#
+        );
+        let project = utils::DefMapFixtureDb::build(&fixture);
+        let target = project.lib("import_cycle");
+        let scope = &target.def_map().modules()[0].scope;
+        let binding = |name: &str| {
+            scope
+                .entry(name)
+                .and_then(|entry| entry.binding(Namespace::Types))
+                .expect("cycle should have a useful type target")
+                .def
+        };
+        assert!(
+            [binding("DirectLeft"), binding("DirectRight")].contains(&binding("FromB")),
+            "a conflicting cycle should retain a real declaration"
+        );
+        assert!(
+            [binding("DirectLeft"), binding("DirectRight")].contains(&binding("FromA")),
+            "a cycle must select a real declaration"
+        );
+        if let Some(expected) = expected {
+            assert_eq!(
+                binding("FromA"),
+                binding(expected),
+                "{a_import} / {b_import}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unseeded_import_cycles_finish_without_inventing_a_definition() {
+    let project = utils::DefMapFixtureDb::build(
+        r#"
+//- /src/lib.rs crate:unseeded_import_cycle
+mod a { pub use crate::b::Thing; pub use crate::b::*; }
+mod b { pub use crate::a::Thing; pub use crate::a::*; }
+use a::Thing;
+"#,
+    );
+    project
+        .lib("unseeded_import_cycle")
+        .entry("Thing")
+        .assert_missing("a cycle without a declaration should finish as unresolved");
 }
