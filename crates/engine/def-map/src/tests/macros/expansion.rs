@@ -302,7 +302,7 @@ make_user!();
 }
 
 #[test]
-fn stops_recursive_generated_macro_expansion_at_pass_limit() {
+fn limits_recursion_without_abandoning_generated_imports() {
     let run = rg_profile::test_support::ProfileTest::start(
         profile_descriptors(),
         "def_map.construction,def_map.macros",
@@ -318,10 +318,11 @@ macro_rules! recurse {
 
 macro_rules! finite_start {
     () => {
-        finite_end!();
+        use crate::finite_end as imported_end;
     };
 }
 
+#[macro_export]
 macro_rules! finite_end {
     () => {
         pub struct FiniteResult;
@@ -330,6 +331,7 @@ macro_rules! finite_end {
 
 recurse!();
 finite_start!();
+imported_end!();
 
 pub struct After;
 "#,
@@ -340,23 +342,18 @@ pub struct After;
     target
         .entry("After")
         .assert_type_exists("macro expansion limit should not abort DefMap construction");
-    target
-        .entry("FiniteResult")
-        .assert_type_exists("an independent finite chain should complete before the limit");
-    snapshot.assert_gauge_bool_with_message(
-        metric::EXPANSION_PASS_LIMIT_REACHED,
-        true,
-        "recursive macro expansion should mark the pass limit as reached",
+    target.entry("FiniteResult").assert_type_exists(
+        "an independent call should resolve its generated import while recursion continues",
     );
-    snapshot.assert_counter_with_message(
-        metric::EXPANSION_PASSES,
-        128,
-        "recursive macro expansion should stop at the configured pass limit",
+    snapshot.assert_gauge_bool_with_message(
+        metric::MACRO_RECURSION_LIMIT_REACHED,
+        true,
+        "recursive expansion should mark the recursion limit as reached",
     );
     snapshot.assert_counter_satisfies_with_message(
         metric::MACRO_CALLS_SKIPPED_BY_LIMIT,
         |skipped| skipped > 0,
-        "recursive macro expansion should leave some retryable calls skipped by limit",
+        "recursive macro expansion should skip its over-limit descendant",
     );
 
     let reports = project
@@ -369,7 +366,7 @@ pub struct After;
     assert_eq!(report.package_name, "recursive_macro_fixture");
     assert_eq!(report.crate_name, "recursive_macro_fixture");
     let [recursive] = report.groups.as_slice() else {
-        panic!("only recursive fallout should remain pending at the limit");
+        panic!("only the recursive invocation should be reported");
     };
     assert_eq!(recursive.macro_name, "recurse");
     assert_eq!(recursive.source_call_count, 0);
@@ -666,4 +663,79 @@ mod facade {
             glob_route_refresh [lib] crate resolves facade::Item [types] -> struct glob_route_refresh[lib]::crate::bridge::Item
         "#]],
     );
+}
+
+#[test]
+fn dependency_generated_exports_reach_reexports_macros_and_sibling_targets() {
+    // Package-name order is the opposite of dependency order. The dependency first generates
+    // both its module and an exported macro; users must see those completed exports together.
+    utils::check_project_path_resolution(
+        r#"
+//- /a/src/lib.rs crate:a_app root:a deps:m_bridge
+use m_bridge::from_dependency;
+from_dependency!();
+pub use m_bridge::Final;
+
+//- /a/src/main.rs crate:a_app root:a kind:bin name:a-tool deps:m_bridge
+pub use a_app::{FromMacro, Final};
+fn main() {}
+
+//- /m/src/lib.rs crate:m_bridge root:m deps:z_dep
+pub use z_dep::generated::*;
+pub use z_dep::from_dependency;
+
+//- /z/src/lib.rs crate:z_dep root:z
+macro_rules! make_exports {
+    () => {
+        pub mod generated { pub struct Final; }
+        #[macro_export]
+        macro_rules! from_dependency {
+            () => { pub use $crate::generated::Final as FromMacro; };
+        }
+    };
+}
+make_exports!();
+"#,
+        &[
+            utils::PathResolutionQuery::lib("a_app", "crate", "Final").types(),
+            utils::PathResolutionQuery::lib("a_app", "crate", "FromMacro").types(),
+            utils::PathResolutionQuery::bin("a_app", "crate", "Final").types(),
+            utils::PathResolutionQuery::bin("a_app", "crate", "FromMacro").types(),
+        ],
+        expect![[r#"
+            a_app [lib] crate resolves Final [types] -> struct z_dep[lib]::crate::generated::Final
+            a_app [lib] crate resolves FromMacro [types] -> struct z_dep[lib]::crate::generated::Final
+            a_app [bin] crate resolves Final [types] -> struct z_dep[lib]::crate::generated::Final
+            a_app [bin] crate resolves FromMacro [types] -> struct z_dep[lib]::crate::generated::Final
+        "#]],
+    );
+}
+
+#[test]
+fn resolves_long_sequences_of_imported_macro_calls() {
+    // Every invocation is written in source, so none is recursively nested. Each one makes the
+    // next macro alias visible through a generated import; the complete sequence needs more
+    // scheduling passes than the recursion limit allows for one nested invocation chain.
+    let mut fixture = String::from(
+        r#"
+//- /src/lib.rs crate:import_chain_fixture
+#[macro_export]
+macro_rules! step {
+    ($next:ident) => { use crate::step as $next; };
+    (@finish) => { pub struct Finished; };
+}
+step!(step_0);
+"#,
+    );
+    for index in 0..130 {
+        fixture.push_str(&format!("step_{index}!(step_{});\n", index + 1));
+    }
+    fixture.push_str("step_130!(@finish);\n");
+    let project = utils::DefMapFixtureDb::build(&fixture);
+    project
+        .lib("import_chain_fixture")
+        .entry("Finished")
+        .assert_type_exists(
+            "independent source invocations should not share a crate-wide expansion allowance",
+        );
 }
